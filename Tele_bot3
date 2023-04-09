@@ -1,0 +1,150 @@
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    CommandHandler,
+    CallbackQueryHandler,
+    CallbackContext,
+    MessageHandler,
+    Updater,
+)
+from telegram import Bot
+from queue import Queue
+from datetime import datetime, timedelta
+
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+MAX_APPOINTMENTS_PER_SLOT = 1
+
+def schedule_keyboard(context: CallbackContext) -> InlineKeyboardMarkup:
+    keyboard = []
+
+    for day in range(7):
+        date = datetime.now() + timedelta(days=day)
+        weekday = WEEKDAYS[date.weekday()]
+        date_str = date.strftime("%Y-%m-%d")
+        
+        if not is_fully_booked(date, context):
+            keyboard.append([InlineKeyboardButton(f"{weekday} ({date_str})", callback_data=date_str)])
+
+    return InlineKeyboardMarkup(keyboard)
+
+def time_slots_keyboard(date_str: str, context: CallbackContext) -> InlineKeyboardMarkup:
+    keyboard = []
+    time_slots_24h = [f"{hour}:00" for hour in range(9, 18)]
+
+    # Convert 24-hour format to 12-hour format with AM/PM indicator
+    time_slots = [datetime.strptime(slot, "%H:%M").strftime("%I:%M %p") for slot in time_slots_24h]
+
+    for i in range(0, len(time_slots), 2):
+        button_text = time_slots[i] if is_time_slot_available(date_str, time_slots_24h[i], context) else f"{time_slots[i]} (Booked)"
+        button_row = [
+            InlineKeyboardButton(
+                button_text,
+                callback_data=f"{date_str} {time_slots[i]}" if is_time_slot_available(date_str, time_slots_24h[i], context) else None,
+            )
+        ]
+        if i + 1 < len(time_slots):
+            button_text = time_slots[i + 1] if is_time_slot_available(date_str, time_slots_24h[i + 1], context) else f"{time_slots[i + 1]} (Booked)"
+            button_row.append(
+                InlineKeyboardButton(
+                    button_text,
+                    callback_data=f"{date_str} {time_slots[i + 1]}" if is_time_slot_available(date_str, time_slots_24h[i + 1], context) else None,
+                )
+            )
+        keyboard.append(button_row)
+
+    return InlineKeyboardMarkup(keyboard)
+
+def is_fully_booked(date: datetime, context: CallbackContext) -> bool:
+    if "appointments" not in context.bot_data:
+        return False
+    date_str = date.strftime("%Y-%m-%d")  # Convert to day/month/year format
+    booked_slots = [slot for uid, slot in context.bot_data["appointments"].items() if slot.startswith(date_str)]
+
+    time_slots = [f"{hour}:00" for hour in range(9, 18)]
+    for slot in time_slots:
+        slot_appointments = [s for s in booked_slots if s.endswith(slot)]
+        if len(slot_appointments) < MAX_APPOINTMENTS_PER_SLOT:
+            return False
+
+    return True
+
+
+def book_appointment(update: Update, context: CallbackContext) -> None:
+    update.effective_message.reply_text(
+        "Please choose a date for your appointment:",
+        reply_markup=schedule_keyboard(context)
+    )
+
+def cancel_appointment(update: Update, context: CallbackContext) -> None:
+    user_id = update.effective_user.id
+
+    if "appointments" not in context.bot_data or user_id not in context.bot_data["appointments"]:
+        update.effective_message.reply_text("You do not have any scheduled appointments.")
+        return
+
+    del context.bot_data["appointments"][user_id]
+    update.effective_message.reply_text("Your appointment has been canceled.")
+
+def handle_schedule_selection(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    selected_date = query.data
+
+    if is_fully_booked(datetime.strptime(selected_date, "%Y-%m-%d"), context):
+        query.answer("The selected date is fully booked. Please choose another date.")
+        return
+
+    query.answer()
+    query.edit_message_text(
+        f"Please choose a time slot on {selected_date}:",
+        reply_markup=time_slots_keyboard(selected_date, context)
+    )
+
+
+def handle_time_slot_selection(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    selected_time_slot = query.data
+
+    # Check if the selected time slot is available
+    date_str, time_slot = selected_time_slot.rsplit(" ", 2)[:2]
+    if not is_time_slot_available(date_str, time_slot, context):
+        query.answer("The selected time slot is not available. Please choose another time slot.")
+        return
+
+    # Save the appointment in the bot's data
+    user_id = update.effective_user.id
+    context.bot_data.setdefault("appointments", {})[user_id] = selected_time_slot
+
+    # Answer the callback query and update the message
+    query.answer()
+    query.edit_message_text(f"Your appointment has been scheduled for {selected_time_slot}. Use /cancel_appointment to cancel it.")
+
+
+def is_time_slot_available(date_str: str, time_slot: str, context: CallbackContext) -> bool:
+    if "appointments" not in context.bot_data:
+        return True
+
+    booked_slots = [slot for uid, slot in context.bot_data["appointments"].items() if slot.startswith(date_str)]
+    slot_appointments = [s for s in booked_slots if s.endswith(time_slot)]
+
+    return len(slot_appointments) < MAX_APPOINTMENTS_PER_SLOT
+
+def main() -> None:
+    updater = Updater("KEY")
+    dispatcher = updater.dispatcher
+
+    dispatcher.add_handler(CommandHandler("book_appointment", book_appointment))
+    dispatcher.add_handler(CommandHandler("cancel_appointment", cancel_appointment))
+    dispatcher.add_handler(CallbackQueryHandler(handle_schedule_selection, pattern="^\d{4}-\d{2}-\d{2}$"))
+    dispatcher.add_handler(CallbackQueryHandler(handle_time_slot_selection, pattern="^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?: AM| PM)$"))
+
+    # Start the Bot
+    updater.start_polling()
+
+    # Run the bot until you press Ctrl-C or the process receives SIGINT,
+    # SIGTERM or SIGABRT. This should be used most of the time, since
+    # start_polling() is non-blocking and will stop the bot gracefully.
+    updater.idle()
+
+
+if __name__ == "__main__":
+    main()
+
